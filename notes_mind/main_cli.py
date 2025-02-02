@@ -371,8 +371,7 @@ class NotesExtractorWorker(QThread):
     def run(self):
         try:
             total_notes = int(
-                #
-                subprocess.check_output(
+                subprocess.check_output(  # noqa: S603 - Hardcoded command
                     [
                         "/usr/bin/osascript",
                         "-e",
@@ -383,7 +382,7 @@ class NotesExtractorWorker(QThread):
             self.progress_signal.emit(f"Processing {total_notes} notes ...")
 
             # Start extraction process
-            process = subprocess.Popen(
+            process = subprocess.Popen(  # noqa: S603 - Hardcoded script
                 ["/usr/bin/osascript", "-e", EXTRACT_SCRIPT.format(split=self.split)],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
@@ -819,7 +818,7 @@ class Notechat(QMainWindow):
         end tell
         """
         try:
-            subprocess.run(["/usr/bin/osascript", "-e", script], check=True)
+            subprocess.run(["/usr/bin/osascript", "-e", script], check=True)  # noqa: S603 - Hardcoded script
         except subprocess.CalledProcessError as e:
             QMessageBox.warning(self, "Error", f"Could not open note: {e!s}")
 
@@ -833,5 +832,9 @@ class NotechatApp:
         sys.exit(app.exec())
 
 
-if __name__ == "__main__":
+def main():
     NotechatApp.run()
+
+
+if __name__ == "__main__":
+    main()
