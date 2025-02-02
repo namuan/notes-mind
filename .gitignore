@@ -1,0 +1,17 @@
+# ignore all root items
+/*
+
+# unignore folders
+!notes_mind/
+
+# unignore files
+!.gitignore
+!README.md
+!pyproject.toml
+!uv.lock
+!Makefile
+!.pre-commit-config.yaml
+!.editorconfig
+!CONTRIBUTING.md
+!LICENSE
+!tox.ini
