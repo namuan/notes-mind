@@ -3,6 +3,7 @@
 
 # unignore folders
 !notes_mind/
+!assets/
 
 # unignore files
 !.gitignore
