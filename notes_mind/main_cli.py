@@ -432,6 +432,46 @@ class OllamaStatusWorker(QThread):
             self.status_signal.emit(False)
 
 
+class SearchEmbeddingsWorker(QThread):
+    search_complete = pyqtSignal(dict)
+
+    def __init__(self, query, db_manager, summarization_assistant):
+        super().__init__()
+        self.query = query
+        self.db_manager = db_manager
+        self.summarization_assistant = summarization_assistant
+
+    def run(self):
+        try:
+            results = self.db_manager.find_similar_notes(self.query, limit=2)
+            response_data = {"response": "", "collections": []}
+
+            if results:
+                response_text = ""
+                seen_titles = set()
+
+                for title, _folder, content, created in results:
+                    summary = content[:500] + "..." if len(content) > 500 else content
+                    response_text += f"{summary} "
+
+                    title_date = (title, created)
+                    if title_date not in seen_titles:
+                        seen_titles.add(title_date)
+                        response_data["collections"].append({
+                            "title": title,
+                            "date": created.split(" ")[0],
+                        })
+
+                response_data["response"] = self.summarization_assistant.generate_summary(response_text.strip())
+            else:
+                response_data["response"] = "I couldn't find any relevant notes matching your query."
+
+            self.search_complete.emit(response_data)
+
+        except Exception as e:
+            self.search_complete.emit({"response": f"Error searching notes: {e!s}", "collections": []})
+
+
 class NotesExtractor(QObject):
     progress_signal = pyqtSignal(str)
     note_extracted = pyqtSignal(dict)
@@ -642,7 +682,7 @@ class Notechat(QMainWindow):
         return input_widget
 
     def init_ui(self):
-        self.setWindowTitle("Notechat")
+        self.setWindowTitle("Notes Mind")
         self.setMinimumSize(1000, 600)
         self.setStyleSheet("QMainWindow { background-color: #F5F5F1; }")
 
@@ -740,11 +780,20 @@ class Notechat(QMainWindow):
         if message.strip():
             user_widget = self.build_user_widget(message)
             self.chat_layout.insertWidget(self.chat_layout.count() - 1, user_widget)
-            matching_documents = self.search_embeddings(message)
-            matching_documents["response"] = self.generate_summary_from(matching_documents["response"])
-            assistant_widget = self.build_assistant_widget(matching_documents)
-            self.chat_layout.insertWidget(self.chat_layout.count() - 1, assistant_widget)
-            QTimer.singleShot(200, self.scroll_to_bottom)
+
+            # Create and start the search worker
+            self.search_worker = SearchEmbeddingsWorker(message, self.db_manager, self.summarization_assistant)
+            self.search_worker.search_complete.connect(self.handle_search_results)
+            self.search_worker.start()
+
+            # Disable input while searching
+            self.text_input.setEnabled(False)
+
+    def handle_search_results(self, matching_documents):
+        assistant_widget = self.build_assistant_widget(matching_documents)
+        self.chat_layout.insertWidget(self.chat_layout.count() - 1, assistant_widget)
+        QTimer.singleShot(200, self.scroll_to_bottom)
+        self.text_input.setEnabled(True)
 
     def scroll_to_bottom(self):
         scroll_area = self.findChild(QScrollArea)
@@ -775,41 +824,6 @@ class Notechat(QMainWindow):
         self.embeddings_worker = EmbeddingsWorker(notes)
         self.embeddings_worker.progress_signal.connect(self.update_progress_message)
         self.embeddings_worker.start()
-
-    def search_embeddings(self, message):
-        try:
-            results = self.db_manager.find_similar_notes(message, limit=2)
-            response_data = {"response": "", "collections": []}
-
-            if results:
-                # Build natural response from results
-                response_text = ""
-                seen_titles = set()
-
-                for title, _folder, content, created in results:
-                    # Add a summary sentence from each document
-                    summary = content[:500] + "..." if len(content) > 500 else content
-                    response_text += f"{summary} "
-
-                    # Only add to collections if title hasn't been seen yet
-                    title_date = (title, created)
-                    if title_date not in seen_titles:
-                        seen_titles.add(title_date)
-                        response_data["collections"].append({
-                            "title": title,
-                            "date": created.split(" ")[0],
-                        })
-
-                response_data["response"] = response_text.strip()
-            else:
-                response_data["response"] = "I couldn't find any relevant notes matching your query."
-        except Exception as e:
-            return {"response": f"Error searching notes: {e!s}", "collections": []}
-        else:
-            return response_data
-
-    def generate_summary_from(self, matching_notes: str):
-        return self.summarization_assistant.generate_summary(matching_notes)
 
     def open_note(self, title):
         script = f"""
