@@ -434,6 +434,7 @@ class OllamaStatusWorker(QThread):
 
 class SearchEmbeddingsWorker(QThread):
     search_complete = pyqtSignal(dict)
+    progress_signal = pyqtSignal(str)
 
     def __init__(self, query, db_manager, summarization_assistant):
         super().__init__()
@@ -443,10 +444,12 @@ class SearchEmbeddingsWorker(QThread):
 
     def run(self):
         try:
+            self.progress_signal.emit("Searching through notes...")
             results = self.db_manager.find_similar_notes(self.query, limit=2)
             response_data = {"response": "", "collections": []}
 
             if results:
+                self.progress_signal.emit("Matching notes found. Generating summary...")
                 response_text = ""
                 seen_titles = set()
 
@@ -462,10 +465,12 @@ class SearchEmbeddingsWorker(QThread):
                             "date": created.split(" ")[0],
                         })
 
+                self.progress_signal.emit("Summarizing...")
                 response_data["response"] = self.summarization_assistant.generate_summary(response_text.strip())
             else:
                 response_data["response"] = "I couldn't find any relevant notes matching your query."
 
+            self.progress_signal.emit("Complete!")
             self.search_complete.emit(response_data)
 
         except Exception as e:
@@ -784,6 +789,7 @@ class Notechat(QMainWindow):
             # Create and start the search worker
             self.search_worker = SearchEmbeddingsWorker(message, self.db_manager, self.summarization_assistant)
             self.search_worker.search_complete.connect(self.handle_search_results)
+            self.search_worker.progress_signal.connect(self.update_progress_message)
             self.search_worker.start()
 
             # Disable input while searching
