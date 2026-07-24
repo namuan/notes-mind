@@ -1,6 +1,6 @@
+import json
 import logging
 import re
-import secrets
 import sqlite3
 import subprocess
 import sys
@@ -9,7 +9,6 @@ from pathlib import Path
 from typing import Optional
 
 import sqlite_vec
-import trafilatura
 from llama_cpp import Llama
 from PyQt6.QtCore import QEasingCurve, QObject, QPropertyAnimation, Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtWidgets import (
@@ -20,6 +19,7 @@ from PyQt6.QtWidgets import (
     QLineEdit,
     QMainWindow,
     QMessageBox,
+    QProgressBar,
     QPushButton,
     QScrollArea,
     QVBoxLayout,
@@ -29,7 +29,7 @@ from sentence_transformers import SentenceTransformer
 
 from notes_mind.config import (
     EMBEDDINGS_PATH,
-    EXTRACT_SCRIPT_TO_FETCH_NOTES,
+    JXA_EXTRACT_NOTES,
     LLM_N_CTX,
     LLM_N_THREADS,
     ST_EMBEDDING_MODEL,
@@ -40,13 +40,25 @@ from notes_mind.config import (
     save_prefs,
 )
 
-model = SentenceTransformer(ST_EMBEDDING_MODEL)
-
 
 class EmbeddingUtils:
-    @staticmethod
-    def get_embeddings(text: str) -> bytes:
-        return model.encode(text).tobytes()
+    _model = None
+
+    @classmethod
+    def _get_model(cls):
+        if cls._model is None:
+            cls._model = SentenceTransformer(ST_EMBEDDING_MODEL)
+        return cls._model
+
+    @classmethod
+    def get_passage_embedding(cls, text: str) -> bytes:
+        model = cls._get_model()
+        return model.encode(text, normalize_embeddings=True).tobytes()
+
+    @classmethod
+    def get_query_embedding(cls, text: str) -> bytes:
+        model = cls._get_model()
+        return model.encode(text, normalize_embeddings=True, prompt_name="query").tobytes()
 
 
 class DatabaseConnection:
@@ -121,9 +133,10 @@ class DatabaseManager:
                 print(f"Error creating tables: {e}")
                 raise
 
-    def find_similar_notes(self, query: str, limit: int = 5) -> list:
+    def find_similar_notes(self, query: str, limit: int = 10) -> list:
         with DatabaseConnection(self.db_path) as cursor:
             try:
+                fts_query = query.replace('"', "").replace("*", "")
                 cursor.execute(
                     """
                 with vec_matches as (
@@ -134,7 +147,8 @@ class DatabaseManager:
                   from vss_notes
                   where
                     content_embedding match :embedding
-                    and k = :limit
+                    and k = :vec_k
+                    and distance < :distance_threshold
                 ),
                 -- the FTS5 search results
                 fts_matches as (
@@ -144,7 +158,7 @@ class DatabaseManager:
                     rank as score
                   from fts_notes
                   where content match :query
-                  limit :limit
+                  limit :fts_limit
                 ),
                 -- combine FTS5 + vector search results with RRF
                 final as (
@@ -170,12 +184,14 @@ class DatabaseManager:
                 select title, folder, content, created from final;
                     """,
                     {
-                        "query": query,
-                        "embedding": EmbeddingUtils.get_embeddings(query),
-                        "limit": limit,
+                        "query": fts_query,
+                        "embedding": EmbeddingUtils.get_query_embedding(query),
+                        "vec_k": limit * 2,
+                        "fts_limit": limit * 2,
                         "rrf_k": 60,
                         "weight_fts": 1.0,
-                        "weight_vec": 1.0,
+                        "weight_vec": 2.0,
+                        "distance_threshold": 0.85,
                     },
                 )
                 return cursor.fetchall()
@@ -236,10 +252,13 @@ class StreamingLabel(QLabel):
 
 class EmbeddingsWorker(QThread):
     progress_signal = pyqtSignal(str)
+    progress_value = pyqtSignal(int, int)
+    finished = pyqtSignal()
 
-    def __init__(self, notes):
+    def __init__(self, notes, db_path=EMBEDDINGS_PATH):
         super().__init__()
         self.notes = notes
+        self.db_path = db_path
 
     def chunk_content(self, content: str, note_id: str) -> list[dict]:
         chunks = []
@@ -263,7 +282,6 @@ class EmbeddingsWorker(QThread):
             current_chunk.append(sentence)
             current_size += sentence_size
 
-        # Handle remaining chunk
         if current_chunk:
             chunk_content = ". ".join(current_chunk) + "."
             chunks.append({"id": f"{note_id}_{len(chunks)}", "content": chunk_content})
@@ -272,11 +290,11 @@ class EmbeddingsWorker(QThread):
 
     def run(self):
         try:
-            self.progress_signal.emit("Creating embeddings...")
+            self.progress_signal.emit("Extracting content from notes...")
             filtered_notes_with_content = []
 
             for note in self.notes:
-                content = trafilatura.extract(note["body"])
+                content = note["body"].strip()
                 if content:
                     chunks = self.chunk_content(content, note["id"])
                     for chunk in chunks:
@@ -285,10 +303,15 @@ class EmbeddingsWorker(QThread):
                         note_with_content["extracted_content"] = chunk["content"]
                         filtered_notes_with_content.append(note_with_content)
 
-            # Prepare data for adding to database
-            with DatabaseConnection(EMBEDDINGS_PATH) as cursor:
-                for note in filtered_notes_with_content:
-                    embeddings = EmbeddingUtils.get_embeddings(note["extracted_content"])
+            total = len(filtered_notes_with_content)
+            self.progress_signal.emit(f"Indexing {total} chunks ...")
+
+            with DatabaseConnection(self.db_path) as cursor:
+                cursor.execute("DELETE FROM vss_notes")
+                cursor.execute("DELETE FROM notes")
+
+                for i, note in enumerate(filtered_notes_with_content):
+                    embeddings = EmbeddingUtils.get_passage_embedding(note["extracted_content"])
                     created = datetime.fromisoformat(note["created"])
                     updated = datetime.fromisoformat(note["updated"])
                     # Insert into main notes table
@@ -319,79 +342,71 @@ class EmbeddingsWorker(QThread):
                         (note_id, embeddings),
                     )
 
-            self.progress_signal.emit("Embeddings created successfully!")
+                    if i % 5 == 0 or i == total - 1:
+                        self.progress_value.emit(i + 1, total)
 
-            with DatabaseConnection(EMBEDDINGS_PATH) as cursor:
-                cursor.execute(
-                    """
-                    insert into fts_notes(rowid, content)
-                    select rowid, content from notes;
-                    """,
-                )
+            self.progress_signal.emit("Building search index...")
 
-            self.progress_signal.emit("Search Index created successfully!")
+            with DatabaseConnection(self.db_path) as cursor:
+                cursor.execute("INSERT INTO fts_notes(fts_notes) VALUES('rebuild')")
+
+            self.progress_signal.emit("Index complete!")
+            self.finished.emit()
 
         except Exception as e:
             self.progress_signal.emit(f"Error creating embeddings: {e!s}")
+            self.finished.emit()
 
 
 class NotesExtractorWorker(QThread):
     progress_signal = pyqtSignal(str)
+    progress_value = pyqtSignal(int, int)
     note_extracted = pyqtSignal(dict)
     error = pyqtSignal(str)
 
-    def __init__(self):
-        super().__init__()
-        self.split = secrets.token_hex(8)
-
     def run(self):
         try:
-            total_notes = int(
-                subprocess.check_output(  # noqa: S603 - Hardcoded command
-                    [
-                        "/usr/bin/osascript",
-                        "-e",
-                        'tell application "Notes" to get count of notes',
-                    ],
-                ).strip()
-            )
-            self.progress_signal.emit(f"Processing {total_notes} notes ...")
+            self.progress_signal.emit("Reading notes from Apple Notes...")
+            self.progress_value.emit(0, 0)
 
-            # Start extraction process
             process = subprocess.Popen(  # noqa: S603 - Hardcoded script
-                ["/usr/bin/osascript", "-e", EXTRACT_SCRIPT_TO_FETCH_NOTES.format(split=self.split)],
+                ["/usr/bin/osascript", "-l", "JavaScript", "-e", JXA_EXTRACT_NOTES, "false"],
                 stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
+                stderr=subprocess.PIPE,
             )
+            stdout, stderr = process.communicate()
 
-            note: dict[str, str] = {}
-            body: list[str] = []
+            if process.returncode != 0:
+                self.error.emit(f"osascript failed: {stderr.decode().strip()}")
+                return
 
-            for line in process.stdout:
+            raw_notes = json.loads(stdout.decode())
+
+            if isinstance(raw_notes, dict) and "error" in raw_notes:
+                self.error.emit(f"Notes extraction failed: {raw_notes['error']}")
+                return
+
+            total = len(raw_notes)
+            self.progress_signal.emit(f"Extracting {total} notes from Apple Notes...")
+
+            for i, raw_note in enumerate(raw_notes):
                 if self.isInterruptionRequested():
-                    process.terminate()
                     return
 
-                line = line.decode("mac_roman").strip()
+                note = {
+                    "id": raw_note["note_id"],
+                    "title": raw_note["title"],
+                    "created": raw_note["created_at"] or "",
+                    "updated": raw_note["modified_at"] or "",
+                    "folder": raw_note.get("folder_path", ""),
+                    "body": raw_note["body"],
+                    "account_id": raw_note.get("account_id", ""),
+                    "account_name": raw_note.get("account_name", ""),
+                }
+                self.note_extracted.emit(note)
+                self.progress_value.emit(i + 1, total)
 
-                if line == f"{self.split}{self.split}":
-                    if note.get("id"):
-                        note["body"] = "\n".join(body).strip()
-                        self.note_extracted.emit(note)
-                    note, body = {}, []
-                    continue
-
-                found_key = False
-                for key in ("id", "title", "folder", "created", "updated"):
-                    if line.startswith(f"{self.split}-{key}: "):
-                        note[key] = line[len(f"{self.split}-{key}: ") :]
-                        found_key = True
-                        break
-                if not found_key:
-                    body.append(line)
-
-            process.stdout.close()
-            process.wait()
+            self.progress_signal.emit(f"Extracted {total} notes")
 
         except Exception as e:
             self.error.emit(str(e))
@@ -432,7 +447,7 @@ class SearchEmbeddingsWorker(QThread):
     def run(self):
         try:
             self.progress_signal.emit("Searching through notes...")
-            results = self.db_manager.find_similar_notes(self.query, limit=2)
+            results = self.db_manager.find_similar_notes(self.query, limit=10)
             response_data = {"response": "", "collections": []}
 
             if results:
@@ -466,6 +481,7 @@ class SearchEmbeddingsWorker(QThread):
 
 class NotesExtractor(QObject):
     progress_signal = pyqtSignal(str)
+    progress_value = pyqtSignal(int, int)
     note_extracted = pyqtSignal(dict)
     finished = pyqtSignal()
     error = pyqtSignal(str)
@@ -476,6 +492,7 @@ class NotesExtractor(QObject):
 
         # Connect worker signals
         self.worker.progress_signal.connect(self.progress_signal)
+        self.worker.progress_value.connect(self.progress_value)
         self.worker.note_extracted.connect(self.note_extracted)
         self.worker.error.connect(self.error)
         self.worker.finished.connect(self.finished)
@@ -515,18 +532,7 @@ class Notechat(QMainWindow):
         self.icon_label.setFixedSize(20, 20)
         self.icon_label.setStyleSheet("background-color: #FFD700; border-radius: 5px;")
 
-        self.progress_label = QLabel()
-        self.progress_label.setStyleSheet(
-            """
-            padding: 2px 8px;
-            color: #666;
-            font-size: 12px;
-        """
-        )
-        self.progress_label.hide()
-
         title_layout.addWidget(self.icon_label)
-        title_layout.addWidget(self.progress_label)
         title_layout.addStretch()
 
         self.model_combo = QComboBox()
@@ -585,6 +591,56 @@ class Notechat(QMainWindow):
 
         return title_bar
 
+    def create_status_bar(self):
+        status = QWidget()
+        status.setStyleSheet(
+            """
+            QWidget {
+                background-color: #E8F5E9;
+                border-bottom: 1px solid #C8E6C9;
+            }
+        """
+        )
+        status_layout = QHBoxLayout(status)
+        status_layout.setContentsMargins(20, 6, 20, 6)
+        status_layout.setSpacing(12)
+
+        self.progress_label = QLabel()
+        self.progress_label.setStyleSheet(
+            """
+            color: #2E7D32;
+            font-size: 12px;
+            font-weight: bold;
+            background: transparent;
+            border: none;
+        """
+        )
+
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setMinimum(0)
+        self.progress_bar.setMaximum(100)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setTextVisible(False)
+        self.progress_bar.setFixedHeight(8)
+        self.progress_bar.setStyleSheet(
+            """
+            QProgressBar {
+                border: none;
+                border-radius: 4px;
+                background-color: #C8E6C9;
+            }
+            QProgressBar::chunk {
+                background-color: #4CAF50;
+                border-radius: 4px;
+            }
+        """
+        )
+
+        status_layout.addWidget(self.progress_label)
+        status_layout.addWidget(self.progress_bar, 1)
+        status.hide()
+        return status
+
     def load_llm_model(self):
         model_path = self.model_combo.currentData()
         if not model_path:
@@ -633,6 +689,7 @@ class Notechat(QMainWindow):
 
         # Connect signals
         self.extractor.progress_signal.connect(self.update_progress_message)
+        self.extractor.progress_value.connect(self.update_progress_value)
         self.extractor.note_extracted.connect(self.handle_note)
         self.extractor.error.connect(self.handle_error)
         self.extractor.finished.connect(self.extraction_finished)
@@ -647,11 +704,25 @@ class Notechat(QMainWindow):
         self.extracted_notes.append(note)
 
     def update_progress_message(self, message: str):
-        self.progress_label.show()
+        parent = self.progress_label.parent()
+        if parent:
+            parent.show()
         self.progress_label.setText(message)
 
+    def update_progress_value(self, current: int, total: int):
+        parent = self.progress_bar.parent()
+        if parent:
+            parent.show()
+        if total == 0:
+            self.progress_bar.setMinimum(0)
+            self.progress_bar.setMaximum(0)
+        else:
+            self.progress_bar.setMinimum(0)
+            self.progress_bar.setMaximum(100)
+            pct = int(current / total * 100)
+            self.progress_bar.setValue(pct)
+
     def extraction_finished(self):
-        self.progress_label.hide()
         self.handle_extracted_notes(self.extracted_notes)
 
     def handle_error(self, error_msg: str):
@@ -755,6 +826,7 @@ class Notechat(QMainWindow):
 
         # Add components
         layout.addWidget(self.create_title_bar())
+        layout.addWidget(self.create_status_bar())
         layout.addWidget(self.create_chat_area())
         layout.addWidget(self.create_input_area())
 
@@ -851,10 +923,16 @@ class Notechat(QMainWindow):
             self.text_input.setEnabled(False)
 
     def handle_search_results(self, matching_documents):
+        QTimer.singleShot(500, self.hide_status)
         assistant_widget = self.build_assistant_widget(matching_documents)
         self.chat_layout.insertWidget(self.chat_layout.count() - 1, assistant_widget)
         QTimer.singleShot(200, self.scroll_to_bottom)
         self.text_input.setEnabled(True)
+
+    def hide_status(self):
+        parent = self.progress_bar.parent()
+        if parent:
+            parent.hide()
 
     def scroll_to_bottom(self):
         scroll_area = self.findChild(QScrollArea)
@@ -884,7 +962,12 @@ class Notechat(QMainWindow):
     def prepare_embeddings(self, notes: list[dict[str, str]]):
         self.embeddings_worker = EmbeddingsWorker(notes)
         self.embeddings_worker.progress_signal.connect(self.update_progress_message)
+        self.embeddings_worker.progress_value.connect(self.update_progress_value)
+        self.embeddings_worker.finished.connect(self.on_embedding_finished)
         self.embeddings_worker.start()
+
+    def on_embedding_finished(self):
+        QTimer.singleShot(1500, self.hide_status)
 
     def open_note(self, title):
         script = f"""

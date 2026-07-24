@@ -3,31 +3,107 @@ from pathlib import Path
 
 # Embedding
 EMBEDDINGS_PATH = Path.home() / ".cache" / "notechat" / "notes.db"
-ST_EMBEDDING_MODEL = "all-MiniLM-L6-v2"
+ST_EMBEDDING_MODEL = "BAAI/bge-small-en-v1.5"
 
-# Credit: https://github.com/yashgoenka/chat-apple-notes
-EXTRACT_SCRIPT_TO_FETCH_NOTES = """
-tell application "Notes"
-   repeat with eachNote in every note
-      set noteId to the id of eachNote
-      set noteTitle to the name of eachNote
-      set noteBody to the body of eachNote
-      set noteCreatedDate to the creation date of eachNote
-      set noteCreated to (noteCreatedDate as «class isot» as string)
-      set noteUpdatedDate to the modification date of eachNote
-      set noteUpdated to (noteUpdatedDate as «class isot» as string)
-      set noteContainer to container of eachNote
-      set noteFolderId to the id of noteContainer
-      log "{split}-id: " & noteId & "\n"
-      log "{split}-created: " & noteCreated & "\n"
-      log "{split}-updated: " & noteUpdated & "\n"
-      log "{split}-folder: " & noteFolderId & "\n"
-      log "{split}-title: " & noteTitle & "\n\n"
-      log noteBody & "\n"
-      log "{split}{split}" & "\n"
-   end repeat
-end tell
-""".strip()
+# JXA script to extract Apple Notes
+JXA_EXTRACT_NOTES = r"""
+function run(argv) {
+    var Notes = Application("Notes");
+    var includeLocked = argv.length > 0 && argv[0] === "true";
+    var output = [];
+
+    try {
+        var accounts = Notes.accounts();
+    } catch (e) {
+        return JSON.stringify({error: "Could not access Notes accounts: " + e.message});
+    }
+
+    for (var ai = 0; ai < accounts.length; ai++) {
+        var account = accounts[ai];
+        var accountId, accountName;
+        try {
+            accountId = String(account.id());
+            accountName = account.name() || "Unknown account";
+        } catch (e) { continue; }
+
+        var folderPaths = {};
+
+        function visitFolder(folder, parentPath) {
+            try {
+                var folderId = String(folder.id());
+                var folderName = folder.name() || "Unknown folder";
+                var path = parentPath ? parentPath + "/" + folderName : folderName;
+                folderPaths[folderId] = path;
+                var children = folder.folders();
+                for (var ci = 0; ci < children.length; ci++) {
+                    visitFolder(children[ci], path);
+                }
+            } catch (e) {}
+        }
+
+        try {
+            var folders = account.folders();
+            for (var fi = 0; fi < folders.length; fi++) {
+                visitFolder(folders[fi], "");
+            }
+        } catch (e) {}
+
+        try {
+            var notes = account.notes();
+        } catch (e) { continue; }
+
+        for (var ni = 0; ni < notes.length; ni++) {
+            var note = notes[ni];
+            try {
+                var noteId = String(note.id());
+                var title = note.name() || "Untitled note";
+
+                var passwordProtected = false;
+                try { passwordProtected = Boolean(note.passwordProtected()); } catch (e) {}
+
+                if (passwordProtected && !includeLocked) continue;
+
+                var body = "";
+                try { body = String(note.plaintext()); } catch (e) {}
+
+                var created = null;
+                try {
+                    var cd = note.creationDate();
+                    if (cd) created = new Date(cd).toISOString();
+                } catch (e) {}
+
+                var modified = null;
+                try {
+                    var md = note.modificationDate();
+                    if (md) modified = new Date(md).toISOString();
+                } catch (e) {}
+
+                var folderId = null;
+                var folderPath = "";
+                try {
+                    var container = note.container();
+                    folderId = String(container.id());
+                    folderPath = folderPaths[folderId] || container.name() || "";
+                } catch (e) {}
+
+                output.push({
+                    note_id: noteId,
+                    account_id: accountId,
+                    account_name: accountName,
+                    title: title,
+                    folder_path: folderPath,
+                    created_at: created,
+                    modified_at: modified,
+                    password_protected: passwordProtected,
+                    body: body
+                });
+            } catch (e) {}
+        }
+    }
+
+    return JSON.stringify(output);
+}
+"""
 
 # LLM (llama.cpp)
 HUGGINGFACE_HUB = Path.home() / ".cache" / "huggingface" / "hub"
