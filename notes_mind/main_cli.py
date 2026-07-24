@@ -8,12 +8,13 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-import ollama
 import sqlite_vec
 import trafilatura
+from llama_cpp import Llama
 from PyQt6.QtCore import QEasingCurve, QObject, QPropertyAnimation, Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtWidgets import (
     QApplication,
+    QComboBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -29,10 +30,14 @@ from sentence_transformers import SentenceTransformer
 from notes_mind.config import (
     EMBEDDINGS_PATH,
     EXTRACT_SCRIPT_TO_FETCH_NOTES,
-    OLLAMA_MODEL,
+    LLM_N_CTX,
+    LLM_N_THREADS,
     ST_EMBEDDING_MODEL,
     SYSTEM_PROMPT,
     USER_PROMPT,
+    discover_gguf_models,
+    load_prefs,
+    save_prefs,
 )
 
 model = SentenceTransformer(ST_EMBEDDING_MODEL)
@@ -180,17 +185,21 @@ class DatabaseManager:
 
 
 class SummarizationAssistant:
+    def __init__(self, llm: Llama):
+        self.llm = llm
+
     def summary_prompt_for(self, matching_notes: str) -> str:
         return USER_PROMPT.format(matching_notes=matching_notes)
 
     def generate_summary(self, matching_notes: str) -> str:
         prompt = self.summary_prompt_for(matching_notes)
-        response = ollama.generate(
-            model=OLLAMA_MODEL,
-            system=SYSTEM_PROMPT,
-            prompt=prompt,
-        ).response
-        return response
+        response = self.llm.create_chat_completion(
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": prompt},
+            ],
+        )
+        return response["choices"][0]["message"]["content"]
 
 
 class StreamingLabel(QLabel):
@@ -388,15 +397,26 @@ class NotesExtractorWorker(QThread):
             self.error.emit(str(e))
 
 
-class OllamaStatusWorker(QThread):
-    status_signal = pyqtSignal(bool)
+class LlmLoadWorker(QThread):
+    model_ready = pyqtSignal(object)
+    error_signal = pyqtSignal(str)
+
+    def __init__(self, model_path: str):
+        super().__init__()
+        self.model_path = model_path
 
     def run(self):
         try:
-            ollama.ps()
-            self.status_signal.emit(True)
-        except Exception:
-            self.status_signal.emit(False)
+            llm = Llama(
+                model_path=self.model_path,
+                n_ctx=LLM_N_CTX,
+                n_threads=LLM_N_THREADS,
+                n_gpu_layers=-1,
+                verbose=False,
+            )
+            self.model_ready.emit(llm)
+        except Exception as e:
+            self.error_signal.emit(str(e))
 
 
 class SearchEmbeddingsWorker(QThread):
@@ -474,12 +494,13 @@ class Notechat(QMainWindow):
         self.chat_layout = None
         self.text_input = None
         self.extracted_notes = []
+        self.llm = None
+        self.summarization_assistant = None
         self.extractor = self.setup_extractor()
         self.db_manager = DatabaseManager(EMBEDDINGS_PATH)
-        self.summarization_assistant = SummarizationAssistant()
         self.init_ui()
         self.db_manager.initialize_database()
-        self.check_ollama_status()
+        self.load_llm_model()
 
     def create_title_bar(self):
         title_bar = QWidget()
@@ -508,6 +529,42 @@ class Notechat(QMainWindow):
         title_layout.addWidget(self.progress_label)
         title_layout.addStretch()
 
+        self.model_combo = QComboBox()
+        self.model_combo.setMinimumWidth(200)
+        self.model_combo.setStyleSheet(
+            """
+            QComboBox {
+                padding: 4px 8px;
+                border: 1px solid #CCC;
+                border-radius: 4px;
+                background-color: white;
+                color: #333;
+                font-size: 11px;
+            }
+            QComboBox::drop-down {
+                border: none;
+            }
+            QComboBox QAbstractItemView {
+                selection-background-color: #E3F2FD;
+                color: #333;
+            }
+        """
+        )
+        models = discover_gguf_models()
+        self.model_combo.blockSignals(True)
+        for display, path in models:
+            self.model_combo.addItem(display, path)
+        self.model_combo.blockSignals(False)
+
+        prefs = load_prefs()
+        last_model = prefs.get("last_model")
+        if last_model:
+            idx = self.model_combo.findData(last_model)
+            if idx >= 0:
+                self.model_combo.setCurrentIndex(idx)
+
+        self.model_combo.currentIndexChanged.connect(self.on_model_changed)
+
         refresh_notes_button = QPushButton("Refresh Notes")
         refresh_notes_button.setStyleSheet(
             """
@@ -523,22 +580,53 @@ class Notechat(QMainWindow):
         refresh_notes_button.clicked.connect(self.handle_extraction)
 
         title_bar_layout.addWidget(title_widget)
+        title_bar_layout.addWidget(self.model_combo)
         title_bar_layout.addWidget(refresh_notes_button)
 
         return title_bar
 
-    def check_ollama_status(self):
-        self.ollama_worker = OllamaStatusWorker()
-        self.ollama_worker.status_signal.connect(self.update_ollama_status)
-        self.ollama_worker.start()
-
-    def update_ollama_status(self, is_connected: bool):
-        if is_connected:
-            self.icon_label.setStyleSheet("background-color: #4CAF50; border-radius: 5px;")
-            self.icon_label.setToolTip("Ollama is connected and running")
-        else:
+    def load_llm_model(self):
+        model_path = self.model_combo.currentData()
+        if not model_path:
             self.icon_label.setStyleSheet("background-color: #F44336; border-radius: 5px;")
-            self.icon_label.setToolTip("Ollama is not connected")
+            self.icon_label.setToolTip("No GGUF models found in ~/.cache/huggingface/hub/")
+            return
+
+        self.llm_worker = LlmLoadWorker(model_path)
+        self.llm_worker.model_ready.connect(self.on_llm_ready)
+        self.llm_worker.error_signal.connect(self.on_llm_error)
+        self.llm_worker.start()
+        self.icon_label.setStyleSheet("background-color: #FF9800; border-radius: 5px;")
+        self.icon_label.setToolTip("Loading LLM model...")
+
+    def on_model_changed(self, index):
+        if index < 0 or not hasattr(self, "model_combo"):
+            return
+        model_path = self.model_combo.currentData()
+        if model_path:
+            save_prefs({"last_model": model_path})
+            self.switch_llm_model(model_path)
+
+    def switch_llm_model(self, model_path: str):
+        if self.llm is not None:
+            self.llm = None
+        self.summarization_assistant = None
+        self.llm_worker = LlmLoadWorker(model_path)
+        self.llm_worker.model_ready.connect(self.on_llm_ready)
+        self.llm_worker.error_signal.connect(self.on_llm_error)
+        self.llm_worker.start()
+        self.icon_label.setStyleSheet("background-color: #FF9800; border-radius: 5px;")
+        self.icon_label.setToolTip("Loading LLM model...")
+
+    def on_llm_ready(self, llm: Llama):
+        self.llm = llm
+        self.summarization_assistant = SummarizationAssistant(llm)
+        self.icon_label.setStyleSheet("background-color: #4CAF50; border-radius: 5px;")
+        self.icon_label.setToolTip("LLM model is ready")
+
+    def on_llm_error(self, error: str):
+        self.icon_label.setStyleSheet("background-color: #F44336; border-radius: 5px;")
+        self.icon_label.setToolTip(f"LLM error: {error}")
 
     def setup_extractor(self):
         self.extractor = NotesExtractor()

@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 # Embedding
@@ -28,8 +29,11 @@ tell application "Notes"
 end tell
 """.strip()
 
-# Summary (Ollama)
-OLLAMA_MODEL = "qwen2.5:latest"
+# LLM (llama.cpp)
+HUGGINGFACE_HUB = Path.home() / ".cache" / "huggingface" / "hub"
+PREFS_FILE = Path.home() / ".cache" / "notechat" / "prefs.json"
+LLM_N_CTX = 4096
+LLM_N_THREADS = 4
 SYSTEM_PROMPT = "You are a helpful summary generator for selected notes."
 USER_PROMPT = """
 You are a summarization assistant. Below is a list of notes.
@@ -48,3 +52,34 @@ List of Notes:
 
 Summary (in HTML):
 """.strip()
+
+
+def discover_gguf_models() -> list[tuple[str, str]]:
+    models = []
+    if not HUGGINGFACE_HUB.exists():
+        return models
+
+    for snap_dir in sorted(HUGGINGFACE_HUB.glob("models--*/snapshots/*/")):
+        for gguf in sorted(snap_dir.glob("*.gguf")):
+            if "mmproj" in gguf.name.lower():
+                continue
+            parts = snap_dir.parts
+            hub_idx = parts.index("hub")
+            model_dir = parts[hub_idx + 1]
+            name = model_dir.replace("models--", "").replace("-GGUF", "").replace("--", "/")
+            quant = gguf.stem.rsplit("-", 1)[-1] if "-" in gguf.stem else ""
+            display = f"{name} ({quant})" if quant else name
+            models.append((display, str(gguf)))
+
+    return sorted(models, key=lambda x: x[0].lower())
+
+
+def load_prefs() -> dict:
+    if PREFS_FILE.exists():
+        return json.loads(PREFS_FILE.read_text())
+    return {}
+
+
+def save_prefs(prefs: dict):
+    PREFS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    PREFS_FILE.write_text(json.dumps(prefs, indent=2))
