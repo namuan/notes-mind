@@ -5,6 +5,9 @@
 !notes_mind/
 !assets/
 
+# common python ignores
+__pycache__/
+
 # unignore files
 !.gitignore
 !README.md
