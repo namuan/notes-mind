@@ -1,5 +1,6 @@
 import json
 import logging
+import os
 import re
 import sqlite3
 import subprocess
@@ -7,6 +8,9 @@ import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
+
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+os.environ.setdefault("PYTORCH_MPS_HIGH_WATERMARK_RATIO", "0.0")
 
 import sqlite_vec
 from llama_cpp import Llama
@@ -49,6 +53,10 @@ class EmbeddingUtils:
         if cls._model is None:
             cls._model = SentenceTransformer(ST_EMBEDDING_MODEL)
         return cls._model
+
+    @classmethod
+    def warm_up(cls):
+        cls._get_model()
 
     @classmethod
     def get_passage_embedding(cls, text: str) -> bytes:
@@ -123,10 +131,7 @@ class DatabaseManager:
                 # Create the FTS virtual table
                 cursor.execute(
                     """
-                    CREATE VIRTUAL TABLE IF NOT EXISTS fts_notes using fts5(
-                      content,
-                      content='notes', content_rowid='id'
-                    );
+                    CREATE VIRTUAL TABLE IF NOT EXISTS fts_notes using fts5(content);
                     """
                 )
             except sqlite3.Error as e:
@@ -136,7 +141,7 @@ class DatabaseManager:
     def find_similar_notes(self, query: str, limit: int = 10) -> list:
         with DatabaseConnection(self.db_path) as cursor:
             try:
-                fts_query = query.replace('"', "").replace("*", "")
+                fts_query = " OR ".join(query.replace('"', "").replace("*", "").split())
                 cursor.execute(
                     """
                 with vec_matches as (
@@ -348,7 +353,13 @@ class EmbeddingsWorker(QThread):
             self.progress_signal.emit("Building search index...")
 
             with DatabaseConnection(self.db_path) as cursor:
-                cursor.execute("INSERT INTO fts_notes(fts_notes) VALUES('rebuild')")
+                cursor.execute("DELETE FROM fts_notes")
+                cursor.execute(
+                    """
+                    INSERT INTO fts_notes(rowid, content)
+                    SELECT id, content FROM notes
+                    """,
+                )
 
             self.progress_signal.emit("Index complete!")
             self.finished.emit()
@@ -984,6 +995,7 @@ class Notechat(QMainWindow):
 class NotechatApp:
     @staticmethod
     def run():
+        EmbeddingUtils.warm_up()
         app = QApplication(sys.argv)
         window = Notechat()
         window.show()
